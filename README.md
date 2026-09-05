@@ -85,6 +85,25 @@ Several sources can be passed at once (later ones win for the same conversation)
 and the official claude.ai export zip (`data-export-*.zip`, where available) is
 accepted too.
 
+Options:
+
+| Flag | Effect |
+|------|--------|
+| `--out DIR` | Write to `DIR/markdown`, `DIR/json`, `DIR/INDEX.md` instead of `chats/` in this repo — e.g. to keep a work archive in a different (private) repo |
+| `--project UUID` | Keep only conversations in that Claude Project; repeat the flag for several. Conversations outside any project (personal chats) are dropped |
+
+Conversations carry `project_uuid` but not the project's name. To map UUIDs to
+names, run this in the claude.ai console (replace `<org uuid>` with the one the
+exporter printed):
+
+```js
+fetch('/api/organizations/<org uuid>/projects').then(r => r.json())
+  .then(p => console.table(p.map(x => ({ uuid: x.uuid, name: x.name }))))
+```
+
+Or just look at the per-project conversation counts and titles — the work
+project is usually obvious.
+
 ### 3. Commit
 
 ```

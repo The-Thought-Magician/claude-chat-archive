@@ -6,12 +6,16 @@ Usage:
     python3 export_chats.py path/to/data-export.zip                            # official export zip
     python3 export_chats.py path/to/extracted-export-dir/                      # ...or its extracted dir
     python3 export_chats.py full.jsonl one-more.jsonl                          # several sources; later wins
+    python3 export_chats.py dump.jsonl --out ~/archive --project <project uuid> # elsewhere, one project only
 
 Accepts the .jsonl downloaded by bookmarklet/export.js (one conversation per
 line, read in a streaming fashion so large archives don't need to fit in
 memory), or the official claude.ai "Export data" zip / conversations.json.
 All carry the same per-conversation shape: uuid, name, created_at, updated_at,
-chat_messages[].
+chat_messages[], and project_uuid when the chat belongs to a Claude Project.
+
+Output goes to <out>/markdown/, <out>/json/ and <out>/INDEX.md; <out> defaults
+to the chats/ directory next to this script.
 """
 
 import argparse
@@ -23,9 +27,7 @@ from datetime import datetime
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent
-CHATS_DIR = REPO_ROOT / "chats"
-MARKDOWN_DIR = CHATS_DIR / "markdown"
-JSON_DIR = CHATS_DIR / "json"
+DEFAULT_OUT = REPO_ROOT / "chats"
 
 
 def as_conversations(data):
@@ -77,24 +79,103 @@ def slugify(text: str, max_len: int = 60) -> str:
     return text[:max_len].rstrip("-") or "untitled"
 
 
-def message_text(message: dict) -> str:
+# Markdown rendering limits. Anything clipped here is still complete in the JSON file.
+TOOL_INPUT_LIMIT = 4000
+TOOL_RESULT_LIMIT = 6000
+SILENT_BLOCKS = {"thinking", "token_budget"}
+
+
+def clip(text: str, limit: int) -> str:
+    if len(text) <= limit:
+        return text
+    return text[:limit] + f"\n… [truncated {len(text) - limit:,} more characters — full content in the JSON file]"
+
+
+def fenced(text: str, lang: str = "") -> str:
+    fence = "````" if "```" in text else "```"
+    return f"{fence}{lang}\n{text.rstrip()}\n{fence}"
+
+
+def details(summary: str, body: str) -> str:
+    return f"<details>\n<summary>{summary}</summary>\n\n{body}\n\n</details>"
+
+
+def tool_result_text(block: dict) -> str:
+    parts = []
+    for item in block.get("content") or []:
+        if not isinstance(item, dict):
+            parts.append(str(item))
+        elif item.get("text"):
+            parts.append(item["text"])
+        else:
+            parts.append(f"[{item.get('type', 'item')}]")
+    return "\n".join(parts)
+
+
+def render_blocks(message: dict) -> list:
+    """One Markdown chunk per content block, in order. Falls back to the legacy text field."""
     blocks = message.get("content") or []
     if not blocks:
-        return message.get("text") or ""
-    parts = []
+        text = (message.get("text") or "").strip()
+        return [text] if text else []
+    out = []
     for block in blocks:
         kind = block.get("type")
-        if kind == "text" and block.get("text"):
-            parts.append(block["text"])
+        if kind == "text":
+            text = (block.get("text") or "").strip()
+            if text:
+                out.append(text)
         elif kind == "tool_use":
-            parts.append(f"*[tool call: {block.get('name', 'unknown')}]*")
+            name = block.get("name") or "tool"
+            note = block.get("message")
+            summary = f"🔧 {name}" + (f" — {note}" if note and note != name else "")
+            body = json.dumps(block.get("input"), indent=2, ensure_ascii=False)
+            out.append(details(summary, fenced(clip(body, TOOL_INPUT_LIMIT), "json")))
         elif kind == "tool_result":
-            parts.append("*[tool result]*")
-        elif kind == "thinking":
+            name = block.get("name") or "tool"
+            text = tool_result_text(block)
+            flag = " ⚠️ error" if block.get("is_error") else ""
+            summary = f"📄 {name} result{flag} ({len(text):,} chars)"
+            out.append(details(summary, fenced(clip(text, TOOL_RESULT_LIMIT))))
+        elif kind in SILENT_BLOCKS:
             continue
         elif kind:
-            parts.append(f"*[{kind}]*")
-    return "\n\n".join(parts) or (message.get("text") or "")
+            out.append(f"*[{kind}]*")
+    return out
+
+
+def render_attachments(message: dict) -> list:
+    """Pasted text attachments (with content) and uploaded files (metadata only)."""
+    out = []
+    for att in message.get("attachments") or []:
+        name = att.get("file_name") or "pasted text"
+        meta = [att.get("file_type"), f"{att.get('file_size')} bytes" if att.get("file_size") else None]
+        meta = ", ".join(str(m) for m in meta if m)
+        summary = f"📎 {name}" + (f" ({meta})" if meta else "")
+        content = att.get("extracted_content") or ""
+        out.append(details(summary, fenced(content)) if content else summary)
+    for f in message.get("files") or []:
+        name = f.get("file_name") or f.get("file_uuid") or "file"
+        out.append(f"🖼️ {name} ({f.get('file_kind') or 'file'}; binary content is not included in the export)")
+    return out
+
+
+def ordered_messages(convo: dict):
+    """Messages along the branch currently shown in the UI (leaf -> root), plus how many
+    sit on other branches (edits/regenerations). Falls back to array order if the
+    conversation has no tree information."""
+    messages = convo.get("chat_messages") or []
+    leaf = convo.get("current_leaf_message_uuid")
+    by_uuid = {m.get("uuid"): m for m in messages}
+    if not leaf or leaf not in by_uuid or not all(m.get("parent_message_uuid") for m in messages):
+        return messages, 0
+    path, seen, cur = [], set(), leaf
+    while cur in by_uuid and cur not in seen:
+        seen.add(cur)
+        path.append(by_uuid[cur])
+        cur = by_uuid[cur].get("parent_message_uuid")
+    path.reverse()
+    return path, len(messages) - len(path)
 
 
 def format_markdown(convo: dict) -> str:
@@ -103,17 +184,26 @@ def format_markdown(convo: dict) -> str:
     lines.append(f"- **UUID:** {convo.get('uuid', '')}")
     lines.append(f"- **Created:** {convo.get('created_at', '')}")
     lines.append(f"- **Updated:** {convo.get('updated_at', '')}")
+    if convo.get("project_uuid"):
+        lines.append(f"- **Project:** {convo['project_uuid']}")
+    if convo.get("model"):
+        lines.append(f"- **Model:** {convo['model']}")
     if convo.get("_export_error"):
         lines.append(f"- **Export error:** {convo['_export_error']} (messages not fetched)")
+
+    messages, omitted = ordered_messages(convo)
+    if omitted:
+        lines.append(f"- **Branches:** {omitted} message(s) on other branches (edits/regenerations) "
+                     f"are omitted here but present in the JSON file")
     lines += ["", "---", ""]
 
-    for msg in convo.get("chat_messages", []) or []:
+    for msg in messages:
         sender = msg.get("sender", "unknown")
         role = "Human" if sender == "human" else "Assistant" if sender == "assistant" else sender.title()
-        text = message_text(msg).strip() or "*(no text content)*"
+        chunks = render_attachments(msg) + render_blocks(msg)
         lines.append(f"### {role} — {msg.get('created_at', '')}")
         lines.append("")
-        lines.append(text)
+        lines.append("\n\n".join(chunks) or "*(no text content)*")
         lines.append("")
 
     return "\n".join(lines)
@@ -127,23 +217,23 @@ def date_prefix(convo: dict) -> str:
         return "0000-00-00"
 
 
-def remove_stale(uuid8: str, keep: str):
+def remove_stale(out: Path, uuid8: str, keep: str):
     """Drop files for the same conversation written under an older title."""
-    for directory, suffix in ((MARKDOWN_DIR, ".md"), (JSON_DIR, ".json")):
+    for directory, suffix in ((out / "markdown", ".md"), (out / "json", ".json")):
         for old in directory.glob(f"*-{uuid8}{suffix}"):
             if old.stem != keep:
                 old.unlink()
 
 
-def write_conversation(convo: dict) -> dict:
+def write_conversation(out: Path, convo: dict) -> dict:
     title = convo.get("name") or "Untitled conversation"
     date = date_prefix(convo)
     uuid8 = (convo.get("uuid") or "")[:8] or "nouuid"
     basename = f"{date}-{slugify(title)}-{uuid8}"
 
-    remove_stale(uuid8, basename)
-    (MARKDOWN_DIR / f"{basename}.md").write_text(format_markdown(convo))
-    (JSON_DIR / f"{basename}.json").write_text(json.dumps(convo, indent=2, ensure_ascii=False))
+    remove_stale(out, uuid8, basename)
+    (out / "markdown" / f"{basename}.md").write_text(format_markdown(convo))
+    (out / "json" / f"{basename}.json").write_text(json.dumps(convo, indent=2, ensure_ascii=False))
 
     label = title.replace("|", "\\|")
     if convo.get("_export_error"):
@@ -156,11 +246,12 @@ def write_conversation(convo: dict) -> dict:
     }
 
 
-def write_index(entries):
+def write_index(out: Path, entries, projects):
+    scope = f" from project(s) {', '.join(projects)}" if projects else ""
     lines = [
         "# Conversation index",
         "",
-        f"{len(entries)} conversations. Generated by `export_chats.py` — do not edit by hand.",
+        f"{len(entries)} conversations{scope}. Generated by `export_chats.py` — do not edit by hand.",
         "",
         "| Date | Title | Messages | Markdown | JSON |",
         "|------|-------|----------|----------|------|",
@@ -171,30 +262,42 @@ def write_index(entries):
             f"| [md](markdown/{entry['basename']}.md) "
             f"| [json](json/{entry['basename']}.json) |"
         )
-    (CHATS_DIR / "INDEX.md").write_text("\n".join(lines) + "\n")
+    (out / "INDEX.md").write_text("\n".join(lines) + "\n")
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("sources", nargs="+", type=Path, help=".jsonl / .json / export .zip / extracted dir")
+    parser.add_argument("--out", type=Path, default=DEFAULT_OUT,
+                        help=f"output directory (default: {DEFAULT_OUT})")
+    parser.add_argument("--project", action="append", default=[], metavar="UUID",
+                        help="keep only conversations in this Claude Project (repeatable)")
     args = parser.parse_args()
 
-    MARKDOWN_DIR.mkdir(parents=True, exist_ok=True)
-    JSON_DIR.mkdir(parents=True, exist_ok=True)
+    out = args.out.expanduser().resolve()
+    (out / "markdown").mkdir(parents=True, exist_ok=True)
+    (out / "json").mkdir(parents=True, exist_ok=True)
+    wanted = set(args.project)
 
     entries = {}
     failed = 0
+    skipped = 0
     for source in args.sources:
         for convo in iter_conversations(source):
-            entry = write_conversation(convo)
+            if wanted and convo.get("project_uuid") not in wanted:
+                skipped += 1
+                continue
+            entry = write_conversation(out, convo)
             entries[convo.get("uuid") or entry["basename"]] = entry
             failed += bool(convo.get("_export_error"))
 
-    write_index(list(entries.values()))
-    print(f"Wrote {len(entries)} conversations to {MARKDOWN_DIR.relative_to(REPO_ROOT)}/ and {JSON_DIR.relative_to(REPO_ROOT)}/")
+    write_index(out, list(entries.values()), args.project)
+    print(f"Wrote {len(entries)} conversations to {out}/markdown/ and {out}/json/")
+    if wanted:
+        print(f"Skipped {skipped} conversation(s) outside project(s) {', '.join(args.project)}")
     if failed:
         print(f"{failed} conversation(s) are title-only stubs (export failed) — re-run the browser export to retry them")
-    print("Updated chats/INDEX.md")
+    print(f"Updated {out}/INDEX.md")
 
 
 if __name__ == "__main__":
