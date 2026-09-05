@@ -14,28 +14,111 @@
    Modes:  window.__CLAUDE_EXPORT_MODE = 'all'      (default) every conversation
            window.__CLAUDE_EXPORT_MODE = 'current'  only the open conversation
    Flags:  window.__CLAUDE_EXPORT_ORG = '<org uuid>'  use a specific organization
+           window.__CLAUDE_EXPORT_CONCURRENCY = 8      max parallel fetches (default 8)
            window.__CLAUDE_EXPORT_FORCE = true        ignore the cache, refetch all
-           window.__CLAUDE_EXPORT_CLEAR = true        wipe the cache and stop */
+           window.__CLAUDE_EXPORT_CLEAR = true        wipe the cache and stop
+
+   Concurrency is adaptive: it starts at CONCURRENCY, halves every time the API
+   answers 429 (honouring Retry-After and pausing all workers together), and
+   creeps back up while requests succeed. So a high setting converges on the
+   fastest rate the API actually allows instead of failing. */
 (async () => {
   const MODE = window.__CLAUDE_EXPORT_MODE || 'all';
   const FORCE = Boolean(window.__CLAUDE_EXPORT_FORCE);
-  const CONCURRENCY = 3;
+  const CONCURRENCY = Math.max(1, Number(window.__CLAUDE_EXPORT_CONCURRENCY) || 8);
   const PAGE_SIZE = 100;
-  const DELAY_MS = 150;
+  const DELAY_MS = 50;
+  const MAX_429_RETRIES = 30;
+  const MAX_OTHER_RETRIES = 5;
+  const MAX_PAUSE_MS = 60000;
   const FLUSH_BYTES = 16 * 1024 * 1024;
   const DB_NAME = 'claude-chat-archive';
   const STORE = 'conversations';
 
   const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
+  /* Adaptive in-flight limiter shared by all workers.
+     - at most `limit` requests are in flight; workers queue for a slot
+     - a 429 pauses everyone until pausedUntil and halves `limit` (once per pause)
+     - sustained success grows `limit` by one at a time, up to CONCURRENCY */
+  let limit = CONCURRENCY;
+  let active = 0;
+  let pausedUntil = 0;
+  let pumpTimer = null;
+  let rateLimited = 0;
+  let successStreak = 0;
+  const waiters = [];
+
+  const pump = () => {
+    const wait = pausedUntil - Date.now();
+    if (wait > 0) {
+      if (!pumpTimer) pumpTimer = setTimeout(() => { pumpTimer = null; pump(); }, wait);
+      return;
+    }
+    while (active < limit && waiters.length) {
+      active += 1;
+      waiters.shift()();
+    }
+  };
+  const acquire = () => new Promise((resolve) => { waiters.push(resolve); pump(); });
+  const release = () => { active -= 1; pump(); };
+
+  const onRateLimited = (retryAfterMs) => {
+    rateLimited += 1;
+    successStreak = 0;
+    const alreadyPaused = Date.now() < pausedUntil;
+    const until = Date.now() + Math.min(retryAfterMs, MAX_PAUSE_MS);
+    if (until > pausedUntil) pausedUntil = until;
+    if (!alreadyPaused) {
+      const before = limit;
+      limit = Math.max(1, Math.floor(limit / 2));
+      console.log('[export] rate limited (429), pausing ' + Math.round((until - Date.now()) / 1000) + 's, concurrency ' + before + ' -> ' + limit);
+    }
+  };
+
+  const onSuccess = () => {
+    successStreak += 1;
+    if (limit < CONCURRENCY && successStreak >= 2 * limit + 10) {
+      limit += 1;
+      successStreak = 0;
+    }
+  };
+
   const api = async (path, attempt = 0) => {
-    const res = await fetch(path, { credentials: 'include', headers: { accept: 'application/json' } });
-    if ((res.status === 429 || res.status >= 500) && attempt < 5) {
+    await acquire();
+    let res;
+    let data;
+    let netError;
+    try {
+      try {
+        res = await fetch(path, { credentials: 'include', headers: { accept: 'application/json' } });
+      } catch (e) {
+        netError = e;
+      }
+      if (res && res.ok) data = await res.json();
+    } finally {
+      release();
+    }
+    if (netError) {
+      if (attempt >= MAX_OTHER_RETRIES) throw netError;
       await sleep(1000 * 2 ** attempt);
       return api(path, attempt + 1);
     }
-    if (!res.ok) throw new Error(res.status + ' ' + res.statusText + ' for ' + path);
-    return res.json();
+    if (res.ok) {
+      onSuccess();
+      return data;
+    }
+    if (res.status === 429) {
+      if (attempt >= MAX_429_RETRIES) throw new Error('429 Too Many Requests, gave up after ' + attempt + ' retries for ' + path);
+      const retryAfter = Number(res.headers.get('retry-after'));
+      onRateLimited(retryAfter > 0 ? retryAfter * 1000 : Math.min(1000 * 2 ** attempt, MAX_PAUSE_MS));
+      return api(path, attempt + 1);
+    }
+    if (res.status >= 500 && attempt < MAX_OTHER_RETRIES) {
+      await sleep(1000 * 2 ** attempt);
+      return api(path, attempt + 1);
+    }
+    throw new Error(res.status + ' ' + res.statusText + ' for ' + path);
   };
 
   /* ---- IndexedDB cache, keyed by conversation uuid ---- */
@@ -154,7 +237,7 @@
   const summaries = await listConversations(org.uuid);
   const total = summaries.length;
   const step = total > 500 ? 100 : 10;
-  console.log('[export] found ' + total + ' conversations' + (FORCE ? ' (cache ignored)' : '') + '...');
+  console.log('[export] found ' + total + ' conversations' + (FORCE ? ' (cache ignored)' : '') + ', ' + CONCURRENCY + ' in parallel...');
 
   const failed = [];
   let reused = 0;
@@ -193,7 +276,8 @@
   await Promise.all(Array.from({ length: CONCURRENCY }, worker));
   const name = 'claude-conversations-' + stamp + '.jsonl';
   const size = download(name);
-  console.log('[export] done: ' + written + ' conversations -> ' + name + ' (' + megabytes(size) + ')');
+  console.log('[export] done: ' + written + ' conversations -> ' + name + ' (' + megabytes(size) + ')'
+    + (rateLimited ? '; hit 429 ' + rateLimited + 'x, concurrency settled at ' + limit + ' (started at ' + CONCURRENCY + ')' : ''));
   if (failed.length) console.warn('[export] ' + failed.length + ' failed (included as title-only stubs, will retry next run):', failed);
 })().catch((e) => {
   console.error('[export] failed:', e);

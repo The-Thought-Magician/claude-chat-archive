@@ -50,7 +50,12 @@ How it behaves:
 - **Size-safe.** Output is JSONL (one conversation per line), built by
   serialising each conversation separately and streaming into a Blob. There's no
   single giant string, so archives of any size download fine.
-- Fetching is throttled (3 concurrent, small delay, backoff on 429/5xx).
+- **Adaptive concurrency.** Starts at 8 parallel fetches (configurable). When
+  the API answers 429 it honours `Retry-After`, pauses *all* workers together,
+  and halves the in-flight limit; while requests keep succeeding the limit
+  creeps back up. So a high setting can't cause failures — it converges on the
+  fastest rate the API actually allows. The end-of-run summary reports how many
+  429s were hit and where concurrency settled.
 - Conversations that fail to fetch are reported in the console and included as
   title-only stubs with an `_export_error` field, so nothing is silently lost.
   They're not cached, so the next run retries them automatically.
@@ -60,6 +65,7 @@ Flags — set in the console before running, if needed:
 | Set | Effect |
 |-----|--------|
 | `window.__CLAUDE_EXPORT_ORG = '<org uuid>'` | Use a specific organization (script prints all it can see) |
+| `window.__CLAUDE_EXPORT_CONCURRENCY = 8` | Starting/max parallel fetches. Safe to set high — it self-tunes down on 429s — but past ~16 you mostly gain pauses, not speed |
 | `window.__CLAUDE_EXPORT_FORCE = true` | Ignore the cache and refetch everything |
 | `window.__CLAUDE_EXPORT_CLEAR = true` | Wipe the cache and stop (frees the browser storage) |
 
