@@ -1,0 +1,8 @@
+# Raw exports downloaded from claude.ai — don't commit the source zip itself
+*.zip
+data-export*/
+conversations.json
+
+.DS_Store
+__pycache__/
+*.pyc
