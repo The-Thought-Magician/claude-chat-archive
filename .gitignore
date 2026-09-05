@@ -1,7 +1,9 @@
-# Raw exports downloaded from claude.ai — don't commit the source zip itself
+# Raw downloads from claude.ai — the per-conversation files under chats/ are
+# the tracked copy, not the source dump
 *.zip
 data-export*/
 conversations.json
+claude-conversation*.json
 
 .DS_Store
 __pycache__/
