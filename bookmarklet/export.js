@@ -3,16 +3,28 @@
    bookmarklet (see README). Uses your existing browser login and the same
    internal API the web app uses, so it works on any plan.
 
-   Downloads a JSON file that export_chats.py understands.
+   Downloads a .jsonl file (one conversation per line) that export_chats.py
+   understands. Each conversation is serialised on its own and streamed into a
+   Blob, so the output size is never limited by JavaScript's max string length.
+
+   Fetched conversations are cached in this tab's IndexedDB as they arrive:
+   an interrupted run resumes where it stopped, and later runs only fetch
+   conversations whose updated_at changed.
 
    Modes:  window.__CLAUDE_EXPORT_MODE = 'all'      (default) every conversation
            window.__CLAUDE_EXPORT_MODE = 'current'  only the open conversation
-   Override org: window.__CLAUDE_EXPORT_ORG = '<org uuid>' */
+   Flags:  window.__CLAUDE_EXPORT_ORG = '<org uuid>'  use a specific organization
+           window.__CLAUDE_EXPORT_FORCE = true        ignore the cache, refetch all
+           window.__CLAUDE_EXPORT_CLEAR = true        wipe the cache and stop */
 (async () => {
   const MODE = window.__CLAUDE_EXPORT_MODE || 'all';
+  const FORCE = Boolean(window.__CLAUDE_EXPORT_FORCE);
   const CONCURRENCY = 3;
   const PAGE_SIZE = 100;
   const DELAY_MS = 150;
+  const FLUSH_BYTES = 16 * 1024 * 1024;
+  const DB_NAME = 'claude-chat-archive';
+  const STORE = 'conversations';
 
   const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -26,10 +38,71 @@
     return res.json();
   };
 
+  /* ---- IndexedDB cache, keyed by conversation uuid ---- */
+  const openDb = () => new Promise((resolve, reject) => {
+    const req = indexedDB.open(DB_NAME, 1);
+    req.onupgradeneeded = () => { req.result.createObjectStore(STORE, { keyPath: 'uuid' }); };
+    req.onsuccess = () => resolve(req.result);
+    req.onerror = () => reject(req.error);
+  });
+
+  const withStore = (db, mode, run) => new Promise((resolve, reject) => {
+    const tx = db.transaction(STORE, mode);
+    let result;
+    run(tx.objectStore(STORE), (value) => { result = value; });
+    tx.oncomplete = () => resolve(result);
+    tx.onerror = () => reject(tx.error);
+    tx.onabort = () => reject(tx.error || new Error('IndexedDB transaction aborted'));
+  });
+
+  const cacheGet = (db, uuid) => withStore(db, 'readonly', (store, set) => {
+    const req = store.get(uuid);
+    req.onsuccess = () => set(req.result);
+  });
+  const cachePut = (db, convo) => withStore(db, 'readwrite', (store) => { store.put(convo); });
+  const cacheClear = (db) => withStore(db, 'readwrite', (store) => { store.clear(); });
+
+  /* ---- output: JSONL streamed into a Blob in chunks ---- */
+  const MIME = 'application/x-ndjson';
+  let blob = new Blob([], { type: MIME });
+  let parts = [];
+  let partsBytes = 0;
+  let written = 0;
+
+  const flush = () => {
+    if (parts.length === 0) return;
+    blob = new Blob([blob, ...parts], { type: MIME });
+    parts = [];
+    partsBytes = 0;
+  };
+
+  const append = (convo) => {
+    const line = JSON.stringify(convo) + '\n';
+    parts.push(line);
+    partsBytes += line.length;
+    written += 1;
+    if (partsBytes >= FLUSH_BYTES) flush();
+  };
+
+  const download = (name) => {
+    flush();
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = name;
+    document.body.appendChild(a);
+    a.click();
+    setTimeout(() => { a.remove(); URL.revokeObjectURL(url); }, 60000);
+    return blob.size;
+  };
+
+  const megabytes = (bytes) => (bytes / 1024 / 1024).toFixed(1) + ' MB';
+
+  /* ---- claude.ai calls ---- */
   const pickOrg = async () => {
     const orgs = await api('/api/organizations');
     if (!Array.isArray(orgs) || orgs.length === 0) throw new Error('No organizations visible for this account');
-    console.log('[export] organizations:', orgs.map((o) => o.uuid + '  ' + o.name));
+    console.log('[export] organizations:\n' + orgs.map((o) => '  ' + o.uuid + '  ' + o.name).join('\n'));
     const override = window.__CLAUDE_EXPORT_ORG;
     if (override) return orgs.find((o) => o.uuid === override) || { uuid: override, name: '(override)' };
     const cookie = document.cookie.match(/lastActiveOrg=([0-9a-f-]{36})/);
@@ -56,16 +129,13 @@
   const fetchConversation = (orgId, id) =>
     api('/api/organizations/' + orgId + '/chat_conversations/' + id + '?tree=True&rendering_mode=messages&render_all_tools=true');
 
-  const download = (name, data) => {
-    const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = name;
-    document.body.appendChild(a);
-    a.click();
-    setTimeout(() => { a.remove(); URL.revokeObjectURL(url); }, 1000);
-  };
+  /* ---- main ---- */
+  const db = await openDb();
+  if (window.__CLAUDE_EXPORT_CLEAR) {
+    await cacheClear(db);
+    console.log('[export] cache cleared');
+    return;
+  }
 
   const stamp = new Date().toISOString().slice(0, 10);
   const org = await pickOrg();
@@ -74,38 +144,58 @@
     const match = location.pathname.match(/\/chat\/([0-9a-f-]{36})/);
     if (!match) throw new Error('Open a conversation first (URL should look like /chat/<uuid>)');
     const convo = await fetchConversation(org.uuid, match[1]);
-    download('claude-conversation-' + match[1].slice(0, 8) + '-' + stamp + '.json', [convo]);
-    console.log('[export] done: 1 conversation');
+    await cachePut(db, convo);
+    append(convo);
+    const size = download('claude-conversation-' + match[1].slice(0, 8) + '-' + stamp + '.jsonl');
+    console.log('[export] done: 1 conversation, ' + megabytes(size));
     return;
   }
 
   const summaries = await listConversations(org.uuid);
-  console.log('[export] found ' + summaries.length + ' conversations, fetching each...');
-  const out = new Array(summaries.length);
+  const total = summaries.length;
+  const step = total > 500 ? 100 : 10;
+  console.log('[export] found ' + total + ' conversations' + (FORCE ? ' (cache ignored)' : '') + '...');
+
   const failed = [];
-  let next = 0;
+  let reused = 0;
+  let fetched = 0;
   let done = 0;
+  let next = 0;
 
   const worker = async () => {
-    while (next < summaries.length) {
-      const i = next;
+    while (next < total) {
+      const summary = summaries[next];
       next += 1;
-      try {
-        out[i] = await fetchConversation(org.uuid, summaries[i].uuid);
-      } catch (e) {
-        failed.push({ uuid: summaries[i].uuid, name: summaries[i].name, error: String(e) });
-        out[i] = summaries[i];
+      let convo;
+      const cached = FORCE ? undefined : await cacheGet(db, summary.uuid);
+      if (cached && cached.updated_at === summary.updated_at) {
+        convo = cached;
+        reused += 1;
+      } else {
+        try {
+          convo = await fetchConversation(org.uuid, summary.uuid);
+          await cachePut(db, convo);
+          fetched += 1;
+        } catch (e) {
+          convo = Object.assign({}, summary, { _export_error: String(e) });
+          failed.push({ uuid: summary.uuid, name: summary.name, error: String(e) });
+        }
+        await sleep(DELAY_MS);
       }
+      append(convo);
       done += 1;
-      if (done % 10 === 0 || done === summaries.length) console.log('[export] ' + done + '/' + summaries.length);
-      await sleep(DELAY_MS);
+      if (done % step === 0 || done === total) {
+        console.log('[export] ' + done + '/' + total + '  (' + reused + ' from cache, ' + fetched + ' fetched, ' + failed.length + ' failed)');
+      }
     }
   };
 
   await Promise.all(Array.from({ length: CONCURRENCY }, worker));
-  download('claude-conversations-' + stamp + '.json', out);
-  console.log('[export] done: ' + (summaries.length - failed.length) + ' ok, ' + failed.length + ' failed', failed);
+  const name = 'claude-conversations-' + stamp + '.jsonl';
+  const size = download(name);
+  console.log('[export] done: ' + written + ' conversations -> ' + name + ' (' + megabytes(size) + ')');
+  if (failed.length) console.warn('[export] ' + failed.length + ' failed (included as title-only stubs, will retry next run):', failed);
 })().catch((e) => {
   console.error('[export] failed:', e);
-  alert('Claude export failed: ' + e.message);
+  alert('Claude export failed: ' + e.message + '\n\nAnything already fetched is cached; just run the export again.');
 });

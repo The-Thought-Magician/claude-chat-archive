@@ -2,13 +2,16 @@
 """Convert exported Claude.ai conversations into per-conversation Markdown + JSON files.
 
 Usage:
-    python3 export_chats.py ~/Downloads/claude-conversations-2026-09-05.json   # from bookmarklet/export.js
+    python3 export_chats.py ~/Downloads/claude-conversations-2026-09-05.jsonl  # from bookmarklet/export.js
     python3 export_chats.py path/to/data-export.zip                            # official export zip
     python3 export_chats.py path/to/extracted-export-dir/                      # ...or its extracted dir
+    python3 export_chats.py full.jsonl one-more.jsonl                          # several sources; later wins
 
-Accepts either the JSON downloaded by bookmarklet/export.js, or the official
-claude.ai "Export data" zip (conversations.json inside). Both carry the same
-per-conversation shape: uuid, name, created_at, updated_at, chat_messages[].
+Accepts the .jsonl downloaded by bookmarklet/export.js (one conversation per
+line, read in a streaming fashion so large archives don't need to fit in
+memory), or the official claude.ai "Export data" zip / conversations.json.
+All carry the same per-conversation shape: uuid, name, created_at, updated_at,
+chat_messages[].
 """
 
 import argparse
@@ -20,26 +23,50 @@ from datetime import datetime
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent
-MARKDOWN_DIR = REPO_ROOT / "chats" / "markdown"
-JSON_DIR = REPO_ROOT / "chats" / "json"
+CHATS_DIR = REPO_ROOT / "chats"
+MARKDOWN_DIR = CHATS_DIR / "markdown"
+JSON_DIR = CHATS_DIR / "json"
 
 
-def load_conversations(source: Path):
+def as_conversations(data):
+    if isinstance(data, dict):
+        return [data]
+    if isinstance(data, list):
+        return data
+    sys.exit("Expected a list of conversations (or a single conversation object)")
+
+
+def iter_conversations(source: Path):
     if source.is_dir():
         candidate = source / "conversations.json"
         if not candidate.exists():
             sys.exit(f"No conversations.json found in {source}")
-        return json.loads(candidate.read_text())
+        yield from as_conversations(json.loads(candidate.read_text()))
+        return
 
     if source.suffix == ".zip":
         with zipfile.ZipFile(source) as zf:
             names = [n for n in zf.namelist() if n.endswith("conversations.json")]
             if not names:
                 sys.exit("No conversations.json found inside the zip")
-            return json.loads(zf.read(names[0]))
+            yield from as_conversations(json.loads(zf.read(names[0])))
+        return
+
+    if source.suffix == ".jsonl":
+        with source.open() as fh:
+            for lineno, line in enumerate(fh, 1):
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    yield json.loads(line)
+                except json.JSONDecodeError as e:
+                    print(f"warning: skipping unreadable line {lineno} of {source.name}: {e}", file=sys.stderr)
+        return
 
     if source.suffix == ".json":
-        return json.loads(source.read_text())
+        yield from as_conversations(json.loads(source.read_text()))
+        return
 
     sys.exit(f"Don't know how to read: {source}")
 
@@ -72,24 +99,19 @@ def message_text(message: dict) -> str:
 
 def format_markdown(convo: dict) -> str:
     title = convo.get("name") or "Untitled conversation"
-    created = convo.get("created_at", "")
-    updated = convo.get("updated_at", "")
-    uuid = convo.get("uuid", "")
-
     lines = [f"# {title}", ""]
-    lines.append(f"- **UUID:** {uuid}")
-    lines.append(f"- **Created:** {created}")
-    lines.append(f"- **Updated:** {updated}")
-    lines.append("")
-    lines.append("---")
-    lines.append("")
+    lines.append(f"- **UUID:** {convo.get('uuid', '')}")
+    lines.append(f"- **Created:** {convo.get('created_at', '')}")
+    lines.append(f"- **Updated:** {convo.get('updated_at', '')}")
+    if convo.get("_export_error"):
+        lines.append(f"- **Export error:** {convo['_export_error']} (messages not fetched)")
+    lines += ["", "---", ""]
 
-    for msg in convo.get("chat_messages", []):
+    for msg in convo.get("chat_messages", []) or []:
         sender = msg.get("sender", "unknown")
         role = "Human" if sender == "human" else "Assistant" if sender == "assistant" else sender.title()
-        ts = msg.get("created_at", "")
         text = message_text(msg).strip() or "*(no text content)*"
-        lines.append(f"### {role} — {ts}")
+        lines.append(f"### {role} — {msg.get('created_at', '')}")
         lines.append("")
         lines.append(text)
         lines.append("")
@@ -105,8 +127,36 @@ def date_prefix(convo: dict) -> str:
         return "0000-00-00"
 
 
+def remove_stale(uuid8: str, keep: str):
+    """Drop files for the same conversation written under an older title."""
+    for directory, suffix in ((MARKDOWN_DIR, ".md"), (JSON_DIR, ".json")):
+        for old in directory.glob(f"*-{uuid8}{suffix}"):
+            if old.stem != keep:
+                old.unlink()
+
+
+def write_conversation(convo: dict) -> dict:
+    title = convo.get("name") or "Untitled conversation"
+    date = date_prefix(convo)
+    uuid8 = (convo.get("uuid") or "")[:8] or "nouuid"
+    basename = f"{date}-{slugify(title)}-{uuid8}"
+
+    remove_stale(uuid8, basename)
+    (MARKDOWN_DIR / f"{basename}.md").write_text(format_markdown(convo))
+    (JSON_DIR / f"{basename}.json").write_text(json.dumps(convo, indent=2, ensure_ascii=False))
+
+    label = title.replace("|", "\\|")
+    if convo.get("_export_error"):
+        label += " ⚠️ export failed"
+    return {
+        "date": date,
+        "title": label,
+        "count": len(convo.get("chat_messages", []) or []),
+        "basename": basename,
+    }
+
+
 def write_index(entries):
-    index_path = REPO_ROOT / "chats" / "INDEX.md"
     lines = [
         "# Conversation index",
         "",
@@ -121,42 +171,29 @@ def write_index(entries):
             f"| [md](markdown/{entry['basename']}.md) "
             f"| [json](json/{entry['basename']}.json) |"
         )
-    index_path.write_text("\n".join(lines) + "\n")
+    (CHATS_DIR / "INDEX.md").write_text("\n".join(lines) + "\n")
 
 
 def main():
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("source", type=Path, help="Path to export .zip, conversations.json, or extracted dir")
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("sources", nargs="+", type=Path, help=".jsonl / .json / export .zip / extracted dir")
     args = parser.parse_args()
-
-    conversations = load_conversations(args.source)
-    if isinstance(conversations, dict):
-        conversations = [conversations]
-    if not isinstance(conversations, list):
-        sys.exit("Expected a list of conversations (or a single conversation object)")
 
     MARKDOWN_DIR.mkdir(parents=True, exist_ok=True)
     JSON_DIR.mkdir(parents=True, exist_ok=True)
 
-    index_entries = []
-    for convo in conversations:
-        title = convo.get("name") or "Untitled conversation"
-        date = date_prefix(convo)
-        uuid8 = (convo.get("uuid") or "")[:8]
-        basename = f"{date}-{slugify(title)}-{uuid8}"
+    entries = {}
+    failed = 0
+    for source in args.sources:
+        for convo in iter_conversations(source):
+            entry = write_conversation(convo)
+            entries[convo.get("uuid") or entry["basename"]] = entry
+            failed += bool(convo.get("_export_error"))
 
-        (MARKDOWN_DIR / f"{basename}.md").write_text(format_markdown(convo))
-        (JSON_DIR / f"{basename}.json").write_text(json.dumps(convo, indent=2))
-
-        index_entries.append({
-            "date": date,
-            "title": title.replace("|", "\\|"),
-            "count": len(convo.get("chat_messages", [])),
-            "basename": basename,
-        })
-
-    write_index(index_entries)
-    print(f"Exported {len(index_entries)} conversations to {MARKDOWN_DIR} and {JSON_DIR}")
+    write_index(list(entries.values()))
+    print(f"Wrote {len(entries)} conversations to {MARKDOWN_DIR.relative_to(REPO_ROOT)}/ and {JSON_DIR.relative_to(REPO_ROOT)}/")
+    if failed:
+        print(f"{failed} conversation(s) are title-only stubs (export failed) — re-run the browser export to retry them")
     print("Updated chats/INDEX.md")
 
 

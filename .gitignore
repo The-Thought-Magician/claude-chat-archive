@@ -4,6 +4,7 @@
 data-export*/
 conversations.json
 claude-conversation*.json
+claude-conversation*.jsonl
 
 .DS_Store
 __pycache__/
